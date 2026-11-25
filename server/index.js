@@ -2,7 +2,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { getDb, DB_PATH, queryOne } = require('./db');
+const { attachAuth } = require('./middleware/auth');
 
+const { router: authRouter } = require('./routes/auth');
 const { router: profileRouter } = require('./routes/profile');
 const { router: foodsRouter } = require('./routes/foods');
 const { router: mealPlansRouter } = require('./routes/mealPlans');
@@ -15,8 +17,9 @@ const PORT = Number(process.env.PORT || 3001);
 
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
+app.use(attachAuth);
 
-// Initialize SQLite connection & auto-seed on startup if empty
+// Initialize SQLite connection & auto-seed/migrate on startup
 getDb();
 
 // Health check endpoint
@@ -36,6 +39,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // Mount API route modules
+app.use('/api', authRouter);
 app.use('/api', profileRouter);
 app.use('/api', foodsRouter);
 app.use('/api', mealPlansRouter);
@@ -50,10 +54,13 @@ app.use('/api/*', (req, res) => {
   });
 });
 
-// Global error handler
+// Global error handler (log stack traces only for unexpected 5xx server errors)
 app.use((err, req, res, next) => {
-  console.error('[Foody API Error]:', err);
-  res.status(err.status || 500).json({
+  const status = err.status || 500;
+  if (status >= 500) {
+    console.error('[Foody API Error]:', err);
+  }
+  res.status(status).json({
     error: err.message || 'Internal Server Error',
   });
 });

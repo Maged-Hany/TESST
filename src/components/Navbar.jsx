@@ -5,7 +5,9 @@ const LINKS = [
   { id: 'my-calories', label: 'MyCalories' },
 ];
 
-export default function Navbar({ active = 'home' }) {
+export default function Navbar({ active = 'home', user = null }) {
+  const accountLabel = user?.name ? user.name.trim().split(/\s+/)[0] : 'Account';
+
   return (
     <header className="nav-wrap">
       <nav className="nav" aria-label="Main">
@@ -21,6 +23,15 @@ export default function Navbar({ active = 'home' }) {
               </a>
             </li>
           ))}
+          <li>
+            <a
+              href="#account"
+              className="nav__link"
+              aria-current={active === 'account' ? 'page' : undefined}
+            >
+              {accountLabel}
+            </a>
+          </li>
         </ul>
       </nav>
     </header>

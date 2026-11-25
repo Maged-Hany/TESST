@@ -12,7 +12,7 @@ export default function Hero() {
           alt="Muscular athlete seen from behind, raising a clenched fist"
           width="493"
           height="998"
-          fetchpriority="high"
+          fetchPriority="high"
         />
       </figure>
 

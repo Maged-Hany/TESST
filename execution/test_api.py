@@ -22,10 +22,12 @@ TEST_PORT = 3099
 BASE_URL = f"http://localhost:{TEST_PORT}/api"
 
 
-def api_request(method: str, path: str, payload: dict = None) -> tuple[int, dict]:
+def api_request(method: str, path: str, payload: dict = None, token: str = None) -> tuple[int, dict]:
     url = f"{BASE_URL}{path}"
     data = None
     headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -246,43 +248,135 @@ def run_tests():
     assert_status(status, 200, "POST /api/ai/analyze-meal", ai_res)
     assert ai_res["calories"] > 0 and ai_res["protein_g"] > 0 and "health_note" in ai_res
 
+    # 10. Input validation answers 400 (never a 500) and photos are served on demand
+    status, res = api_request("POST", "/food-logs", {"food_name": "Bad", "calories": -5})
+    assert_status(status, 400, "POST /api/food-logs rejects negative calories", res)
+    status, res = api_request("POST", "/food-logs", {"food_name": "Bad", "meal_type": "brunch"})
+    assert_status(status, 400, "POST /api/food-logs rejects unknown meal_type", res)
+    status, res = api_request("POST", "/food-logs", {"food_name": "Bad", "date": "2026-13-45"})
+    assert_status(status, 400, "POST /api/food-logs rejects invalid date", res)
+    status, res = api_request("POST", "/food-logs", {"food_name": "Bad", "image_data": "<script>"})
+    assert_status(status, 400, "POST /api/food-logs rejects non-image image_data", res)
+    status, res = api_request("PUT", "/profile", {"age": "abc"})
+    assert_status(status, 400, "PUT /api/profile rejects non-numeric age", res)
+    status, res = api_request("GET", "/food-logs?date=banana")
+    assert_status(status, 400, "GET /api/food-logs rejects invalid date", res)
+
+    photo = "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
+    status, created = api_request(
+        "POST",
+        "/food-logs",
+        {"date": "2026-01-15", "meal_type": "lunch", "food_name": "Photo meal", "calories": 300, "image_data": photo},
+    )
+    assert_status(status, 201, "POST /api/food-logs with photo", created)
+    entry = created["entry"]
+    assert "image_data" not in entry and entry["has_image"] and entry["image_url"], "photo must not be inlined"
+    assert "image_data" not in created["summary"]["items"][0], "list items must not inline photos"
+    with urllib.request.urlopen(f"http://localhost:{TEST_PORT}{entry['image_url']}", timeout=10) as img:
+        assert img.status == 200 and img.headers["Content-Type"] == "image/jpeg", "image route must stream the photo"
+    print("  [PASS] GET /api/food-logs/:id/image (HTTP 200)")
+    status, res = api_request("GET", "/food-logs/summary?from=2026-01-15&to=2026-01-15")
+    assert_status(status, 200, "GET /api/food-logs/summary", res)
+    assert res["days"] and res["days"][0]["calories"] == 300
+    status, res = api_request("DELETE", f"/food-logs/{entry['id']}")
+    assert_status(status, 200, "DELETE /api/food-logs/:id (photo meal)", res)
+
+    # 11. 42 Recommended Exercises (6 per muscle + YouTube IDs) & Split Switching
+    status, ex_all = api_request("GET", "/exercises")
+    assert_status(status, 200, "GET /api/exercises (with 6 recommended/muscle)", ex_all)
+    rec_by_mg = ex_all["recommended_by_muscle"]
+    for mg in ("Chest", "Back", "Shoulders", "Legs", "Biceps", "Triceps", "Core"):
+        assert len(rec_by_mg[mg]) == 6, f"Expected 6 recommended exercises for {mg}"
+        assert all(item["youtube_id"] for item in rec_by_mg[mg]), f"Missing youtube_id in {mg}"
+
+    # 12. Account Registration, Consecutive-Day Login Streak ("You got a streak") & >10 Elite Tier
+    import uuid
+    unique_email = f"streak_{uuid.uuid4().hex[:8]}@example.com"
+    status, reg = api_request(
+        "POST",
+        "/auth/register",
+        {"name": "Streak Tester", "email": unique_email, "password": "password123", "date": "2026-11-01"},
+    )
+    assert_status(status, 201, "POST /api/auth/register", reg)
+    token = reg["token"]
+    assert reg["streak"]["current_streak"] == 1
+
+    # Day 2 login -> extends streak to 2 and triggers "You got a streak"
+    status, login2 = api_request(
+        "POST",
+        "/auth/login",
+        {"email": unique_email, "password": "password123", "date": "2026-11-02"},
+    )
+    assert_status(status, 200, "POST /api/auth/login (Day 2 consecutive streak)", login2)
+    assert login2["streak"]["current_streak"] == 2
+    assert login2["streak"]["streak_extended"] is True
+    assert login2["streak"]["popup_message"] == "You got a streak"
+
+    # Switch split method for authenticated account
+    status, split_res = api_request(
+        "POST",
+        "/workout-plans/apply-split",
+        {"split_method": "arnold"},
+        token=token,
+    )
+    assert_status(status, 200, "POST /api/workout-plans/apply-split (arnold)", split_res)
+    assert len(split_res["plans"]) == 7 and split_res["plans"][0]["title"] == "Chest & Back A"
+
+    # Simulate logging workouts up to 11 consecutive days to verify >10 Elite badge tier
+    for day_num in range(3, 12):
+        d_str = f"2026-11-{day_num:02d}"
+        status, st = api_request(
+            "POST",
+            "/streak/check-in",
+            {"date": d_str, "source": "workout"},
+            token=token,
+        )
+    assert_status(status, 200, "POST /api/streak/check-in (11-day >10 elite streak)", st)
+    assert st["current_streak"] == 11 and st["is_elite"] is True
+
     print("\nAll end-to-end API assertions passed successfully!")
 
 
 def main():
     env = os.environ.copy()
     env["PORT"] = str(TEST_PORT)
-    server_proc = subprocess.Popen(
-        ["node", str(ROOT_DIR / "server" / "index.js")],
-        cwd=str(ROOT_DIR),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    try:
-        # Wait for server to become ready
-        ready = False
-        for _ in range(25):
-            try:
-                status, _ = api_request("GET", "/health")
-                if status == 200:
-                    ready = True
-                    break
-            except Exception:
-                time.sleep(0.2)
-        if not ready:
-            out, err = server_proc.communicate(timeout=2)
-            raise RuntimeError(
-                f"Server failed to start on port {TEST_PORT}.\nSTDOUT: {out.decode()}\nSTDERR: {err.decode()}"
-            )
+    log_dir = ROOT_DIR / ".tmp"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    server_log_path = log_dir / "test_api_server.log"
 
-        run_tests()
-    finally:
-        server_proc.terminate()
+    with open(server_log_path, "w", encoding="utf-8") as log_file:
+        server_proc = subprocess.Popen(
+            ["node", str(ROOT_DIR / "server" / "index.js")],
+            cwd=str(ROOT_DIR),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
         try:
-            server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
+            # Wait for server to become ready
+            ready = False
+            for _ in range(25):
+                try:
+                    status, _ = api_request("GET", "/health")
+                    if status == 200:
+                        ready = True
+                        break
+                except Exception:
+                    time.sleep(0.2)
+            if not ready:
+                log_file.flush()
+                logs = server_log_path.read_text(encoding="utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Server failed to start on port {TEST_PORT}.\nLOGS:\n{logs}"
+                )
+
+            run_tests()
+        finally:
+            server_proc.terminate()
+            try:
+                server_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Foody - Nutrition Tracking, Weekly Meal Planner, and Workout Schedule Platform",
   "private": true,
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "server": "node server/index.js",
     "server:watch": "node --watch server/index.js",

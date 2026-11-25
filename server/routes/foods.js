@@ -2,13 +2,42 @@ const express = require('express');
 const router = express.Router();
 const { queryAll, queryOne, execute } = require('../db');
 const { getTodayDateString } = require('../utils/calculations');
+const {
+  MEAL_TYPES,
+  badRequest,
+  addDays,
+  daysBetween,
+  readDate,
+  readEnum,
+  readImageData,
+  readNumber,
+  readText,
+} = require('../utils/validate');
+const { getProfileRow } = require('../middleware/auth');
 
-function buildDailyNutritionSummary(dateStr) {
-  const profile = queryOne('SELECT * FROM user_profile WHERE id = 1');
+// Photos are stored as data URLs. Never ship them inside list responses —
+// a day with a few photos would otherwise weigh megabytes. Rows expose
+// `has_image` + `image_url` instead and the photo is streamed on demand.
+const LOG_COLUMNS = `id, date, meal_type, food_id, food_name, servings, serving_size, serving_unit,
+  calories, protein_g, carbs_g, fat_g, fiber_g, notes, logged_at,
+  (image_data LIKE 'data:image/%') AS has_image`;
+
+function withImageUrl(row) {
+  if (!row) return row;
+  const hasImage = Boolean(row.has_image);
+  return { ...row, has_image: hasImage, image_url: hasImage ? `/api/food-logs/${row.id}/image` : null };
+}
+
+function getFoodLog(id) {
+  return withImageUrl(queryOne(`SELECT ${LOG_COLUMNS} FROM food_logs WHERE id = ?`, [id]));
+}
+
+function buildDailyNutritionSummary(dateStr, userId = 0) {
+  const profile = getProfileRow(userId);
   const logs = queryAll(
-    'SELECT * FROM food_logs WHERE date = ? ORDER BY id ASC',
-    [dateStr]
-  );
+    `SELECT ${LOG_COLUMNS} FROM food_logs WHERE date = ? AND user_id = ? ORDER BY id ASC`,
+    [dateStr, userId]
+  ).map(withImageUrl);
 
   const meals = {
     breakfast: [],
@@ -221,27 +250,63 @@ router.delete('/foods/:id', (req, res) => {
 
 // GET /api/food-logs?date=YYYY-MM-DD
 router.get('/food-logs', (req, res) => {
-  const dateStr = req.query.date || getTodayDateString();
-  res.json(buildDailyNutritionSummary(dateStr));
+  const dateStr = readDate(req.query.date, getTodayDateString());
+  res.json(buildDailyNutritionSummary(dateStr, req.userId));
+});
+
+// GET /api/food-logs/summary?from=YYYY-MM-DD&to=YYYY-MM-DD
+// Lightweight per-day calorie totals (used by the MyCalories week strip).
+router.get('/food-logs/summary', (req, res) => {
+  const to = readDate(req.query.to, getTodayDateString(), 'to');
+  const from = readDate(req.query.from, addDays(to, -6), 'from');
+  const span = daysBetween(from, to);
+  if (span < 0) throw badRequest('from must not be after to');
+  if (span > 92) throw badRequest('The range can cover at most 93 days');
+
+  const days = queryAll(
+    `SELECT date, SUM(calories) AS calories, COUNT(*) AS entries
+     FROM food_logs WHERE user_id = ? AND date >= ? AND date <= ? GROUP BY date ORDER BY date ASC`,
+    [req.userId, from, to]
+  ).map((r) => ({ date: r.date, calories: Math.round(Number(r.calories || 0)), entries: Number(r.entries) }));
+
+  const profile = getProfileRow(req.userId);
+  res.json({ from, to, target_calories: profile?.daily_calorie_target || 2200, days });
+});
+
+// GET /api/food-logs/:id/image
+router.get('/food-logs/:id/image', (req, res) => {
+  const row = queryOne('SELECT image_data FROM food_logs WHERE id = ?', [Number(req.params.id)]);
+  const match =
+    row && typeof row.image_data === 'string'
+      ? row.image_data.match(/^data:(image\/(?:jpeg|png|webp));base64,(.+)$/s)
+      : null;
+  if (!match) return res.status(404).json({ error: 'No photo saved for this entry' });
+
+  res.set('Content-Type', match[1]);
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Cache-Control', 'private, max-age=31536000, immutable');
+  res.send(Buffer.from(match[2], 'base64'));
 });
 
 // POST /api/food-logs
 router.post('/food-logs', (req, res) => {
-  const dateStr = req.body.date || getTodayDateString();
-  const meal_type = ['breakfast', 'lunch', 'dinner', 'snack'].includes(req.body.meal_type)
-    ? req.body.meal_type
-    : 'breakfast';
-  const servings = Number(req.body.servings ?? 1);
+  const body = req.body || {};
+  const dateStr = readDate(body.date, getTodayDateString());
+  const meal_type = readEnum(body.meal_type, MEAL_TYPES, 'breakfast', 'meal_type');
+  const servings = readNumber(body.servings, { label: 'servings', min: 0.01, max: 100, fallback: 1 });
 
-  let food_id = req.body.food_id ? Number(req.body.food_id) : null;
-  let food_name = req.body.food_name;
-  let serving_size = Number(req.body.serving_size ?? 100);
-  let serving_unit = req.body.serving_unit || 'g';
-  let calories = Number(req.body.calories ?? 0);
-  let protein_g = Number(req.body.protein_g ?? 0);
-  let carbs_g = Number(req.body.carbs_g ?? 0);
-  let fat_g = Number(req.body.fat_g ?? 0);
-  let fiber_g = Number(req.body.fiber_g ?? 0);
+  let food_id = body.food_id ? Number(body.food_id) : null;
+  let food_name = readText(body.food_name, '', 120);
+  let serving_size = readNumber(body.serving_size, { label: 'serving_size', min: 0, max: 100000, fallback: 100 });
+  let serving_unit = readText(body.serving_unit, 'g', 30) || 'g';
+
+  const macroOpts = (label, max) => ({ label, min: 0, max, fallback: 0 });
+  let calories = readNumber(body.calories, macroOpts('calories', 20000));
+  let protein_g = readNumber(body.protein_g, macroOpts('protein_g', 2000));
+  let carbs_g = readNumber(body.carbs_g, macroOpts('carbs_g', 2000));
+  let fat_g = readNumber(body.fat_g, macroOpts('fat_g', 2000));
+  let fiber_g = readNumber(body.fiber_g, macroOpts('fiber_g', 2000));
+  const image_data = readImageData(body.image_data);
 
   if (food_id) {
     const catalogFood = queryOne('SELECT * FROM foods WHERE id = ?', [food_id]);
@@ -251,7 +316,7 @@ router.post('/food-logs', (req, res) => {
     food_name = food_name || catalogFood.name;
     serving_size = catalogFood.serving_size;
     serving_unit = catalogFood.serving_unit;
-    if (req.body.calories === undefined) {
+    if (body.calories === undefined) {
       calories = Math.round(catalogFood.calories * servings);
       protein_g = Number((catalogFood.protein_g * servings).toFixed(1));
       carbs_g = Number((catalogFood.carbs_g * servings).toFixed(1));
@@ -260,20 +325,21 @@ router.post('/food-logs', (req, res) => {
     }
   }
 
-  if (!food_name || !String(food_name).trim()) {
-    return res.status(400).json({ error: 'food_name or valid food_id is required' });
+  if (!food_name) {
+    throw badRequest('food_name or valid food_id is required');
   }
 
   const result = execute(
     `INSERT INTO food_logs (
-      date, meal_type, food_id, food_name, servings, serving_size, serving_unit,
+      user_id, date, meal_type, food_id, food_name, servings, serving_size, serving_unit,
       calories, protein_g, carbs_g, fat_g, fiber_g, notes, image_data
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
+      req.userId,
       dateStr,
       meal_type,
       food_id,
-      String(food_name).trim(),
+      food_name,
       servings,
       serving_size,
       serving_unit,
@@ -282,34 +348,38 @@ router.post('/food-logs', (req, res) => {
       carbs_g,
       fat_g,
       fiber_g,
-      req.body.notes || '',
-      req.body.image_data || '',
+      readText(body.notes, '', 500),
+      image_data,
     ]
   );
 
-  const created = queryOne('SELECT * FROM food_logs WHERE id = ?', [Number(result.lastInsertRowid)]);
   res.status(201).json({
-    entry: created,
-    summary: buildDailyNutritionSummary(dateStr),
+    entry: getFoodLog(Number(result.lastInsertRowid)),
+    summary: buildDailyNutritionSummary(dateStr, req.userId),
   });
 });
 
 // PUT /api/food-logs/:id
 router.put('/food-logs/:id', (req, res) => {
   const id = Number(req.params.id);
-  const existing = queryOne('SELECT * FROM food_logs WHERE id = ?', [id]);
+  const existing = queryOne('SELECT * FROM food_logs WHERE id = ? AND user_id = ?', [id, req.userId]);
   if (!existing) return res.status(404).json({ error: 'Food log entry not found' });
 
-  const servings = Number(req.body.servings ?? existing.servings);
-  const meal_type = req.body.meal_type ?? existing.meal_type;
-  const notes = req.body.notes ?? existing.notes;
-  let calories = req.body.calories !== undefined ? Number(req.body.calories) : existing.calories;
-  let protein_g = req.body.protein_g !== undefined ? Number(req.body.protein_g) : existing.protein_g;
-  let carbs_g = req.body.carbs_g !== undefined ? Number(req.body.carbs_g) : existing.carbs_g;
-  let fat_g = req.body.fat_g !== undefined ? Number(req.body.fat_g) : existing.fat_g;
-  let fiber_g = req.body.fiber_g !== undefined ? Number(req.body.fiber_g) : existing.fiber_g;
+  const body = req.body || {};
+  const servings = readNumber(body.servings, { label: 'servings', min: 0.01, max: 100, fallback: existing.servings });
+  const meal_type = readEnum(body.meal_type, MEAL_TYPES, existing.meal_type, 'meal_type');
+  const notes = readText(body.notes, existing.notes, 500);
+  const food_name = readText(body.food_name, existing.food_name, 120);
+  if (!food_name) throw badRequest('food_name cannot be empty');
 
-  if (req.body.servings !== undefined && req.body.calories === undefined && existing.food_id) {
+  const macroOpts = (label, max, fallback) => ({ label, min: 0, max, fallback });
+  let calories = readNumber(body.calories, macroOpts('calories', 20000, existing.calories));
+  let protein_g = readNumber(body.protein_g, macroOpts('protein_g', 2000, existing.protein_g));
+  let carbs_g = readNumber(body.carbs_g, macroOpts('carbs_g', 2000, existing.carbs_g));
+  let fat_g = readNumber(body.fat_g, macroOpts('fat_g', 2000, existing.fat_g));
+  let fiber_g = readNumber(body.fiber_g, macroOpts('fiber_g', 2000, existing.fiber_g));
+
+  if (body.servings !== undefined && body.calories === undefined && existing.food_id) {
     const catalogFood = queryOne('SELECT * FROM foods WHERE id = ?', [existing.food_id]);
     if (catalogFood) {
       calories = Math.round(catalogFood.calories * servings);
@@ -324,39 +394,27 @@ router.put('/food-logs/:id', (req, res) => {
     `UPDATE food_logs
      SET meal_type = ?, food_name = ?, servings = ?, calories = ?,
          protein_g = ?, carbs_g = ?, fat_g = ?, fiber_g = ?, notes = ?
-     WHERE id = ?`,
-    [
-      meal_type,
-      req.body.food_name ?? existing.food_name,
-      servings,
-      Math.round(calories),
-      protein_g,
-      carbs_g,
-      fat_g,
-      fiber_g,
-      notes,
-      id,
-    ]
+     WHERE id = ? AND user_id = ?`,
+    [meal_type, food_name, servings, Math.round(calories), protein_g, carbs_g, fat_g, fiber_g, notes, id, req.userId]
   );
 
-  const updated = queryOne('SELECT * FROM food_logs WHERE id = ?', [id]);
   res.json({
-    entry: updated,
-    summary: buildDailyNutritionSummary(updated.date),
+    entry: getFoodLog(id),
+    summary: buildDailyNutritionSummary(existing.date, req.userId),
   });
 });
 
 // DELETE /api/food-logs/:id
 router.delete('/food-logs/:id', (req, res) => {
   const id = Number(req.params.id);
-  const existing = queryOne('SELECT * FROM food_logs WHERE id = ?', [id]);
+  const existing = queryOne('SELECT id, date FROM food_logs WHERE id = ? AND user_id = ?', [id, req.userId]);
   if (!existing) return res.status(404).json({ error: 'Food log entry not found' });
 
-  execute('DELETE FROM food_logs WHERE id = ?', [id]);
+  execute('DELETE FROM food_logs WHERE id = ? AND user_id = ?', [id, req.userId]);
   res.json({
     deleted: true,
     id,
-    summary: buildDailyNutritionSummary(existing.date),
+    summary: buildDailyNutritionSummary(existing.date, req.userId),
   });
 });
 

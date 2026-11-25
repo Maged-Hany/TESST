@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { queryAll, queryOne, execute, transaction } = require('../db');
 const { calculate1RM, getTodayDateString } = require('../utils/calculations');
+const { MUSCLE_GROUPS_ORDERED, SPLIT_PRESETS } = require('../utils/workoutCatalog');
+const { seedUserInitialPlans, getProfileRow, recordStreakActivity } = require('../middleware/auth');
 
 const DAYS_ORDERED = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
 
@@ -9,7 +11,7 @@ function getWorkoutPlanWithExercises(planId) {
   const plan = queryOne('SELECT * FROM workout_plans WHERE id = ?', [planId]);
   if (!plan) return null;
   const exercises = queryAll(
-    `SELECT wpe.*, e.name AS exercise_name, e.muscle_group, e.equipment, e.movement_type, e.instructions
+    `SELECT wpe.*, e.name AS exercise_name, e.muscle_group, e.equipment, e.movement_type, e.instructions, e.youtube_id
      FROM workout_plan_exercises wpe
      JOIN exercises e ON e.id = wpe.exercise_id
      WHERE wpe.workout_plan_id = ?
@@ -22,8 +24,12 @@ function getWorkoutPlanWithExercises(planId) {
   };
 }
 
-function getAllWorkoutPlans() {
-  const plans = queryAll('SELECT * FROM workout_plans');
+function getAllWorkoutPlans(userId = 0) {
+  let plans = queryAll('SELECT * FROM workout_plans WHERE user_id = ?', [userId]);
+  if (plans.length === 0 && userId > 0) {
+    seedUserInitialPlans(userId, 'ppl');
+    plans = queryAll('SELECT * FROM workout_plans WHERE user_id = ?', [userId]);
+  }
   const sorted = plans.sort(
     (a, b) => DAYS_ORDERED.indexOf(a.day_of_week) - DAYS_ORDERED.indexOf(b.day_of_week)
   );
@@ -33,7 +39,7 @@ function getAllWorkoutPlans() {
 function enrichWorkoutLog(logRow) {
   if (!logRow) return null;
   const sets = queryAll(
-    `SELECT wls.*, e.muscle_group, e.equipment
+    `SELECT wls.*, e.muscle_group, e.equipment, e.youtube_id
      FROM workout_log_sets wls
      LEFT JOIN exercises e ON e.id = wls.exercise_id
      WHERE wls.workout_log_id = ?
@@ -68,7 +74,7 @@ function enrichWorkoutLog(logRow) {
 
 // GET /api/exercises
 router.get('/exercises', (req, res) => {
-  const { q, muscle_group, equipment } = req.query;
+  const { q, muscle_group, equipment, recommended_only } = req.query;
   const conditions = [];
   const params = [];
 
@@ -85,12 +91,23 @@ router.get('/exercises', (req, res) => {
     conditions.push('equipment = ?');
     params.push(equipment);
   }
+  if (recommended_only === '1' || recommended_only === 'true') {
+    conditions.push('is_recommended = 1');
+  }
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const items = queryAll(
-    `SELECT * FROM exercises ${whereClause} ORDER BY muscle_group ASC, name ASC`,
+    `SELECT * FROM exercises ${whereClause} ORDER BY is_recommended DESC, muscle_group ASC, id ASC`,
     params
   );
+
+  const recommendedRows = queryAll(
+    'SELECT * FROM exercises WHERE is_recommended = 1 ORDER BY id ASC'
+  );
+  const recommended_by_muscle = {};
+  for (const mg of MUSCLE_GROUPS_ORDERED) {
+    recommended_by_muscle[mg] = recommendedRows.filter((r) => r.muscle_group === mg).slice(0, 6);
+  }
 
   const muscle_groups = queryAll('SELECT DISTINCT muscle_group FROM exercises ORDER BY muscle_group ASC').map(
     (r) => r.muscle_group
@@ -101,6 +118,8 @@ router.get('/exercises', (req, res) => {
 
   res.json({
     items,
+    recommended_by_muscle,
+    recommended_muscle_groups: MUSCLE_GROUPS_ORDERED,
     muscle_groups,
     equipment_types,
     total: items.length,
@@ -115,6 +134,7 @@ router.post('/exercises', (req, res) => {
     equipment = 'Dumbbell',
     movement_type = 'Compound',
     instructions = '',
+    youtube_id = '',
   } = req.body;
 
   if (!name || !String(name).trim()) {
@@ -122,14 +142,15 @@ router.post('/exercises', (req, res) => {
   }
 
   const result = execute(
-    `INSERT INTO exercises (name, muscle_group, equipment, movement_type, instructions, is_custom)
-     VALUES (?, ?, ?, ?, ?, 1)`,
+    `INSERT INTO exercises (name, muscle_group, equipment, movement_type, instructions, youtube_id, is_custom)
+     VALUES (?, ?, ?, ?, ?, ?, 1)`,
     [
       String(name).trim(),
       String(muscle_group).trim(),
       String(equipment).trim(),
       String(movement_type).trim(),
       instructions,
+      String(youtube_id || '').trim(),
     ]
   );
 
@@ -146,9 +167,9 @@ router.get('/exercises/:id/history', (req, res) => {
     `SELECT wls.*, wl.date, wl.title AS workout_title
      FROM workout_log_sets wls
      JOIN workout_logs wl ON wl.id = wls.workout_log_id
-     WHERE wls.exercise_id = ?
+     WHERE wls.exercise_id = ? AND wl.user_id = ?
      ORDER BY wl.date ASC, wls.set_number ASC`,
-    [exerciseId]
+    [exerciseId, req.userId]
   );
 
   const byDate = {};
@@ -186,13 +207,45 @@ router.get('/exercises/:id/history', (req, res) => {
 
 // GET /api/workout-plans
 router.get('/workout-plans', (req, res) => {
-  res.json(getAllWorkoutPlans());
+  res.json(getAllWorkoutPlans(req.userId));
+});
+
+// POST /api/workout-plans/apply-split — Switch between PPL, Upper/Lower, Arnold, Bro Split, Full Body, or Custom
+router.post('/workout-plans/apply-split', (req, res) => {
+  const splitKey = String(req.body?.split_method || 'ppl').toLowerCase();
+  if (!SPLIT_PRESETS[splitKey]) {
+    return res.status(400).json({
+      error: `split_method must be one of: ${Object.keys(SPLIT_PRESETS).join(', ')}`,
+    });
+  }
+
+  transaction(() => {
+    seedUserInitialPlans(req.userId, splitKey);
+    if (req.userId > 0) {
+      execute("UPDATE users SET split_method = ?, updated_at = datetime('now') WHERE id = ?", [
+        splitKey,
+        req.userId,
+      ]);
+    } else {
+      execute("UPDATE user_profile SET split_method = ?, updated_at = datetime('now') WHERE id = 1", [
+        splitKey,
+      ]);
+    }
+  });
+
+  res.json({
+    split_method: splitKey,
+    label: SPLIT_PRESETS[splitKey].label,
+    plans: getAllWorkoutPlans(req.userId),
+  });
 });
 
 // GET /api/workout-plans/:id
 router.get('/workout-plans/:id', (req, res) => {
   const plan = getWorkoutPlanWithExercises(Number(req.params.id));
-  if (!plan) return res.status(404).json({ error: 'Workout plan not found' });
+  if (!plan || plan.user_id !== req.userId) {
+    return res.status(404).json({ error: 'Workout plan not found' });
+  }
   res.json(plan);
 });
 
@@ -203,14 +256,18 @@ router.post('/workout-plans', (req, res) => {
     return res.status(400).json({ error: 'Invalid day_of_week' });
   }
 
-  const existing = queryOne('SELECT * FROM workout_plans WHERE day_of_week = ?', [day_of_week]);
+  const existing = queryOne(
+    'SELECT * FROM workout_plans WHERE user_id = ? AND day_of_week = ?',
+    [req.userId, day_of_week]
+  );
+
   const planId = transaction(() => {
     let id;
     if (existing) {
       execute(
         `UPDATE workout_plans
          SET title = ?, focus_area = ?, estimated_duration_min = ?, is_rest_day = ?, notes = ?
-         WHERE id = ?`,
+         WHERE id = ? AND user_id = ?`,
         [
           req.body.title ?? existing.title,
           req.body.focus_area ?? existing.focus_area,
@@ -218,14 +275,16 @@ router.post('/workout-plans', (req, res) => {
           req.body.is_rest_day ? 1 : 0,
           req.body.notes ?? existing.notes,
           existing.id,
+          req.userId,
         ]
       );
       id = existing.id;
     } else {
       const resInsert = execute(
-        `INSERT INTO workout_plans (day_of_week, title, focus_area, estimated_duration_min, is_rest_day, notes)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO workout_plans (user_id, day_of_week, title, focus_area, estimated_duration_min, is_rest_day, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [
+          req.userId,
           day_of_week,
           req.body.title || 'Workout Session',
           req.body.focus_area || 'General Fitness',
@@ -267,14 +326,14 @@ router.post('/workout-plans', (req, res) => {
 // PUT /api/workout-plans/:id
 router.put('/workout-plans/:id', (req, res) => {
   const id = Number(req.params.id);
-  const existing = queryOne('SELECT * FROM workout_plans WHERE id = ?', [id]);
+  const existing = queryOne('SELECT * FROM workout_plans WHERE id = ? AND user_id = ?', [id, req.userId]);
   if (!existing) return res.status(404).json({ error: 'Workout plan not found' });
 
   transaction(() => {
     execute(
       `UPDATE workout_plans
        SET title = ?, focus_area = ?, estimated_duration_min = ?, is_rest_day = ?, notes = ?
-       WHERE id = ?`,
+       WHERE id = ? AND user_id = ?`,
       [
         req.body.title ?? existing.title,
         req.body.focus_area ?? existing.focus_area,
@@ -282,6 +341,7 @@ router.put('/workout-plans/:id', (req, res) => {
         req.body.is_rest_day !== undefined ? (req.body.is_rest_day ? 1 : 0) : existing.is_rest_day,
         req.body.notes ?? existing.notes,
         id,
+        req.userId,
       ]
     );
 
@@ -310,15 +370,38 @@ router.put('/workout-plans/:id', (req, res) => {
   res.json(getWorkoutPlanWithExercises(id));
 });
 
-// POST /api/workout-plans/:id/exercises
+// POST /api/workout-plans/:id/exercises — Supports recommended exercise_id OR manual exercise_name
 router.post('/workout-plans/:id/exercises', (req, res) => {
   const planId = Number(req.params.id);
-  const existing = queryOne('SELECT * FROM workout_plans WHERE id = ?', [planId]);
+  const existing = queryOne('SELECT * FROM workout_plans WHERE id = ? AND user_id = ?', [planId, req.userId]);
   if (!existing) return res.status(404).json({ error: 'Workout plan not found' });
 
-  const exerciseId = Number(req.body.exercise_id);
-  const exercise = queryOne('SELECT * FROM exercises WHERE id = ?', [exerciseId]);
-  if (!exercise) return res.status(404).json({ error: 'Exercise not found' });
+  let exerciseId = req.body.exercise_id ? Number(req.body.exercise_id) : null;
+  let exercise = exerciseId ? queryOne('SELECT * FROM exercises WHERE id = ?', [exerciseId]) : null;
+
+  // Support adding any custom manual workout directly by name
+  if (!exercise && req.body.exercise_name && String(req.body.exercise_name).trim()) {
+    const cleanName = String(req.body.exercise_name).trim();
+    exercise = queryOne('SELECT * FROM exercises WHERE LOWER(name) = LOWER(?)', [cleanName]);
+    if (!exercise) {
+      const ins = execute(
+        `INSERT INTO exercises (name, muscle_group, equipment, movement_type, instructions, is_custom)
+         VALUES (?, ?, ?, 'Compound', '', 1)`,
+        [cleanName, String(req.body.muscle_group || 'Custom').trim(), String(req.body.equipment || 'Custom').trim()]
+      );
+      exerciseId = Number(ins.lastInsertRowid);
+      exercise = queryOne('SELECT * FROM exercises WHERE id = ?', [exerciseId]);
+    } else {
+      exerciseId = exercise.id;
+    }
+  }
+
+  if (!exercise) return res.status(404).json({ error: 'Select an exercise or enter a workout name' });
+
+  // Automatically flip a Rest day to a Training day when an exercise is added
+  if (existing.is_rest_day) {
+    execute('UPDATE workout_plans SET is_rest_day = 0 WHERE id = ?', [planId]);
+  }
 
   const countRow = queryOne(
     'SELECT COUNT(*) AS cnt FROM workout_plan_exercises WHERE workout_plan_id = ?',
@@ -348,6 +431,9 @@ router.post('/workout-plans/:id/exercises', (req, res) => {
 router.put('/workout-plans/:planId/exercises/:itemId', (req, res) => {
   const planId = Number(req.params.planId);
   const itemId = Number(req.params.itemId);
+  const planOwner = queryOne('SELECT id FROM workout_plans WHERE id = ? AND user_id = ?', [planId, req.userId]);
+  if (!planOwner) return res.status(404).json({ error: 'Workout plan not found' });
+
   const existing = queryOne(
     'SELECT * FROM workout_plan_exercises WHERE id = ? AND workout_plan_id = ?',
     [itemId, planId]
@@ -378,6 +464,9 @@ router.put('/workout-plans/:planId/exercises/:itemId', (req, res) => {
 router.delete('/workout-plans/:planId/exercises/:itemId', (req, res) => {
   const planId = Number(req.params.planId);
   const itemId = Number(req.params.itemId);
+  const planOwner = queryOne('SELECT id FROM workout_plans WHERE id = ? AND user_id = ?', [planId, req.userId]);
+  if (!planOwner) return res.status(404).json({ error: 'Workout plan not found' });
+
   execute('DELETE FROM workout_plan_exercises WHERE id = ? AND workout_plan_id = ?', [itemId, planId]);
   res.json(getWorkoutPlanWithExercises(planId));
 });
@@ -385,8 +474,8 @@ router.delete('/workout-plans/:planId/exercises/:itemId', (req, res) => {
 // GET /api/workout-logs
 router.get('/workout-logs', (req, res) => {
   const { date, from, to, limit = 25 } = req.query;
-  const conditions = [];
-  const params = [];
+  const conditions = ['user_id = ?'];
+  const params = [req.userId];
 
   if (date) {
     conditions.push('date = ?');
@@ -401,7 +490,7 @@ router.get('/workout-logs', (req, res) => {
     params.push(to);
   }
 
-  const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
   params.push(Number(limit));
 
   const logs = queryAll(
@@ -414,18 +503,22 @@ router.get('/workout-logs', (req, res) => {
 
 // GET /api/workout-logs/:id
 router.get('/workout-logs/:id', (req, res) => {
-  const row = queryOne('SELECT * FROM workout_logs WHERE id = ?', [Number(req.params.id)]);
+  const row = queryOne('SELECT * FROM workout_logs WHERE id = ? AND user_id = ?', [
+    Number(req.params.id),
+    req.userId,
+  ]);
   if (!row) return res.status(404).json({ error: 'Workout log not found' });
   res.json(enrichWorkoutLog(row));
 });
 
-// POST /api/workout-logs
+// POST /api/workout-logs — Logs a workout session and updates the account's streak!
 router.post('/workout-logs', (req, res) => {
   const dateStr = req.body.date || getTodayDateString();
   const planId = req.body.workout_plan_id || req.body.from_workout_plan_id || null;
   let plan = null;
   if (planId) {
-    plan = getWorkoutPlanWithExercises(Number(planId));
+    const candidate = getWorkoutPlanWithExercises(Number(planId));
+    if (candidate && candidate.user_id === req.userId) plan = candidate;
   }
 
   const title = req.body.title || plan?.title || 'Strength Training Session';
@@ -436,7 +529,6 @@ router.post('/workout-logs', (req, res) => {
 
   let setsToInsert = Array.isArray(req.body.sets) ? req.body.sets : [];
 
-  // If no explicit sets were passed but from_workout_plan_id / workout_plan_id was provided, build default sets from the plan
   if (setsToInsert.length === 0 && plan && Array.isArray(plan.exercises)) {
     for (const pEx of plan.exercises) {
       const parsedReps = parseInt(String(pEx.target_reps).split('-')[0], 10) || 10;
@@ -457,9 +549,9 @@ router.post('/workout-logs', (req, res) => {
   const createdLogId = transaction(() => {
     const insertRes = execute(
       `INSERT INTO workout_logs (
-        date, workout_plan_id, title, focus_area, duration_min, calories_burned, notes
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [dateStr, plan ? plan.id : null, title, focus_area, duration_min, calories_burned, notes]
+        user_id, date, workout_plan_id, title, focus_area, duration_min, calories_burned, notes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [req.userId, dateStr, plan ? plan.id : null, title, focus_area, duration_min, calories_burned, notes]
     );
     const logId = Number(insertRes.lastInsertRowid);
 
@@ -478,12 +570,14 @@ router.post('/workout-logs', (req, res) => {
       const is_warmup = s.is_warmup ? 1 : 0;
       const estimated_1rm = !is_warmup && weight_kg > 0 ? calculate1RM(weight_kg, reps).estimated_1rm : 0;
 
-      // Check if this is a Personal Record (PR) compared to previous sets for this exercise
       let is_pr = s.is_pr ? 1 : 0;
       if (!is_warmup && exId && estimated_1rm > 0 && s.is_pr === undefined) {
         const prevBest = queryOne(
-          'SELECT MAX(estimated_1rm) AS best FROM workout_log_sets WHERE exercise_id = ? AND is_warmup = 0',
-          [exId]
+          `SELECT MAX(wls.estimated_1rm) AS best
+           FROM workout_log_sets wls
+           JOIN workout_logs wl ON wl.id = wls.workout_log_id
+           WHERE wls.exercise_id = ? AND wls.is_warmup = 0 AND wl.user_id = ?`,
+          [exId, req.userId]
         );
         if (!prevBest || !prevBest.best || estimated_1rm > Number(prevBest.best)) {
           is_pr = 1;
@@ -513,21 +607,27 @@ router.post('/workout-logs', (req, res) => {
     return logId;
   });
 
+  // Record this workout date toward the user's streak!
+  const streak = recordStreakActivity(req.userId, dateStr, 'workout');
   const createdRow = queryOne('SELECT * FROM workout_logs WHERE id = ?', [createdLogId]);
-  res.status(201).json(enrichWorkoutLog(createdRow));
+
+  res.status(201).json({
+    ...enrichWorkoutLog(createdRow),
+    streak,
+  });
 });
 
 // PUT /api/workout-logs/:id
 router.put('/workout-logs/:id', (req, res) => {
   const id = Number(req.params.id);
-  const existing = queryOne('SELECT * FROM workout_logs WHERE id = ?', [id]);
+  const existing = queryOne('SELECT * FROM workout_logs WHERE id = ? AND user_id = ?', [id, req.userId]);
   if (!existing) return res.status(404).json({ error: 'Workout log not found' });
 
   transaction(() => {
     execute(
       `UPDATE workout_logs
        SET date = ?, title = ?, focus_area = ?, duration_min = ?, calories_burned = ?, notes = ?
-       WHERE id = ?`,
+       WHERE id = ? AND user_id = ?`,
       [
         req.body.date ?? existing.date,
         req.body.title ?? existing.title,
@@ -536,6 +636,7 @@ router.put('/workout-logs/:id', (req, res) => {
         Number(req.body.calories_burned ?? existing.calories_burned),
         req.body.notes ?? existing.notes,
         id,
+        req.userId,
       ]
     );
 
@@ -581,10 +682,10 @@ router.put('/workout-logs/:id', (req, res) => {
 // DELETE /api/workout-logs/:id
 router.delete('/workout-logs/:id', (req, res) => {
   const id = Number(req.params.id);
-  const existing = queryOne('SELECT * FROM workout_logs WHERE id = ?', [id]);
+  const existing = queryOne('SELECT * FROM workout_logs WHERE id = ? AND user_id = ?', [id, req.userId]);
   if (!existing) return res.status(404).json({ error: 'Workout log not found' });
 
-  execute('DELETE FROM workout_logs WHERE id = ?', [id]);
+  execute('DELETE FROM workout_logs WHERE id = ? AND user_id = ?', [id, req.userId]);
   res.json({ deleted: true, id });
 });
 

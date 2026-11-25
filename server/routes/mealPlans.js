@@ -2,17 +2,21 @@ const express = require('express');
 const router = express.Router();
 const { queryAll, queryOne, execute, transaction } = require('../db');
 const { getTodayDateString } = require('../utils/calculations');
+const { getProfileRow } = require('../middleware/auth');
 
 const DAYS_OF_WEEK = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
 
-function getWeeklyMealPlan(filterDay = null) {
-  const profile = queryOne('SELECT * FROM user_profile WHERE id = 1');
+function getWeeklyMealPlan(filterDay = null, userId = 0) {
+  const profile = getProfileRow(userId);
   const rows = filterDay
     ? queryAll(
-        'SELECT * FROM meal_plans WHERE day_of_week = ? ORDER BY order_index ASC, id ASC',
-        [filterDay.toLowerCase()]
+        'SELECT * FROM meal_plans WHERE user_id = ? AND day_of_week = ? ORDER BY order_index ASC, id ASC',
+        [userId, filterDay.toLowerCase()]
       )
-    : queryAll('SELECT * FROM meal_plans ORDER BY order_index ASC, id ASC');
+    : queryAll(
+        'SELECT * FROM meal_plans WHERE user_id = ? ORDER BY order_index ASC, id ASC',
+        [userId]
+      );
 
   const days = {};
   for (const d of DAYS_OF_WEEK) {
@@ -43,10 +47,10 @@ function getWeeklyMealPlan(filterDay = null) {
 
   return {
     targets: {
-      calories: profile?.daily_calorie_target || 2200,
-      protein_g: profile?.daily_protein_g || 180,
-      carbs_g: profile?.daily_carbs_g || 220,
-      fat_g: profile?.daily_fat_g || 65,
+      calories: profile?.daily_calorie_target || 2290,
+      protein_g: profile?.daily_protein_g || 200,
+      carbs_g: profile?.daily_carbs_g || 229,
+      fat_g: profile?.daily_fat_g || 64,
     },
     days,
   };
@@ -55,7 +59,7 @@ function getWeeklyMealPlan(filterDay = null) {
 // GET /api/meal-plans
 router.get('/meal-plans', (req, res) => {
   const { day_of_week } = req.query;
-  res.json(getWeeklyMealPlan(day_of_week || null));
+  res.json(getWeeklyMealPlan(day_of_week || null, req.userId));
 });
 
 // POST /api/meal-plans
@@ -97,10 +101,11 @@ router.post('/meal-plans', (req, res) => {
 
   const result = execute(
     `INSERT INTO meal_plans (
-      day_of_week, meal_type, food_id, meal_name, servings, serving_unit,
+      user_id, day_of_week, meal_type, food_id, meal_name, servings, serving_unit,
       calories, protein_g, carbs_g, fat_g, prep_notes, is_completed, order_index
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
+      req.userId,
       day_of_week,
       meal_type,
       food_id,
@@ -124,14 +129,14 @@ router.post('/meal-plans', (req, res) => {
 // PUT /api/meal-plans/:id
 router.put('/meal-plans/:id', (req, res) => {
   const id = Number(req.params.id);
-  const existing = queryOne('SELECT * FROM meal_plans WHERE id = ?', [id]);
+  const existing = queryOne('SELECT * FROM meal_plans WHERE id = ? AND user_id = ?', [id, req.userId]);
   if (!existing) return res.status(404).json({ error: 'Meal plan item not found' });
 
   execute(
     `UPDATE meal_plans
      SET day_of_week = ?, meal_type = ?, meal_name = ?, servings = ?, serving_unit = ?,
          calories = ?, protein_g = ?, carbs_g = ?, fat_g = ?, prep_notes = ?, is_completed = ?
-     WHERE id = ?`,
+     WHERE id = ? AND user_id = ?`,
     [
       req.body.day_of_week ? String(req.body.day_of_week).toLowerCase() : existing.day_of_week,
       req.body.meal_type ?? existing.meal_type,
@@ -145,6 +150,7 @@ router.put('/meal-plans/:id', (req, res) => {
       req.body.prep_notes ?? existing.prep_notes,
       req.body.is_completed !== undefined ? (req.body.is_completed ? 1 : 0) : existing.is_completed,
       id,
+      req.userId,
     ]
   );
 
@@ -154,7 +160,7 @@ router.put('/meal-plans/:id', (req, res) => {
 // POST /api/meal-plans/:id/log — Log a planned meal directly into daily food_logs
 router.post('/meal-plans/:id/log', (req, res) => {
   const id = Number(req.params.id);
-  const planItem = queryOne('SELECT * FROM meal_plans WHERE id = ?', [id]);
+  const planItem = queryOne('SELECT * FROM meal_plans WHERE id = ? AND user_id = ?', [id, req.userId]);
   if (!planItem) return res.status(404).json({ error: 'Meal plan item not found' });
 
   const dateStr = req.body.date || getTodayDateString();
@@ -170,10 +176,11 @@ router.post('/meal-plans/:id/log', (req, res) => {
 
   const logRes = execute(
     `INSERT INTO food_logs (
-      date, meal_type, food_id, food_name, servings, serving_size, serving_unit,
+      user_id, date, meal_type, food_id, food_name, servings, serving_size, serving_unit,
       calories, protein_g, carbs_g, fat_g, fiber_g, notes
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
+      req.userId,
       dateStr,
       planItem.meal_type,
       planItem.food_id,
@@ -190,7 +197,7 @@ router.post('/meal-plans/:id/log', (req, res) => {
     ]
   );
 
-  execute('UPDATE meal_plans SET is_completed = 1 WHERE id = ?', [id]);
+  execute('UPDATE meal_plans SET is_completed = 1 WHERE id = ? AND user_id = ?', [id, req.userId]);
 
   res.status(201).json({
     logged_entry: queryOne('SELECT * FROM food_logs WHERE id = ?', [Number(logRes.lastInsertRowid)]),
@@ -205,17 +212,21 @@ router.post('/meal-plans/day/:dayOfWeek/log-all', (req, res) => {
     return res.status(400).json({ error: 'Invalid dayOfWeek' });
   }
   const dateStr = req.body.date || getTodayDateString();
-  const planItems = queryAll('SELECT * FROM meal_plans WHERE day_of_week = ? ORDER BY order_index ASC', [day]);
+  const planItems = queryAll(
+    'SELECT * FROM meal_plans WHERE user_id = ? AND day_of_week = ? ORDER BY order_index ASC',
+    [req.userId, day]
+  );
 
   const createdLogs = transaction(() => {
     const inserted = [];
     for (const item of planItems) {
       const logRes = execute(
         `INSERT INTO food_logs (
-          date, meal_type, food_id, food_name, servings, serving_size, serving_unit,
+          user_id, date, meal_type, food_id, food_name, servings, serving_size, serving_unit,
           calories, protein_g, carbs_g, fat_g, fiber_g, notes
-        ) VALUES (?, ?, ?, ?, ?, 100, ?, ?, ?, ?, ?, 0, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, 100, ?, ?, ?, ?, ?, 0, ?)`,
         [
+          req.userId,
           dateStr,
           item.meal_type,
           item.food_id,
@@ -229,7 +240,7 @@ router.post('/meal-plans/day/:dayOfWeek/log-all', (req, res) => {
           item.prep_notes || `Logged from ${day} meal plan`,
         ]
       );
-      execute('UPDATE meal_plans SET is_completed = 1 WHERE id = ?', [item.id]);
+      execute('UPDATE meal_plans SET is_completed = 1 WHERE id = ? AND user_id = ?', [item.id, req.userId]);
       inserted.push(queryOne('SELECT * FROM food_logs WHERE id = ?', [Number(logRes.lastInsertRowid)]));
     }
     return inserted;
@@ -246,10 +257,10 @@ router.post('/meal-plans/day/:dayOfWeek/log-all', (req, res) => {
 // DELETE /api/meal-plans/:id
 router.delete('/meal-plans/:id', (req, res) => {
   const id = Number(req.params.id);
-  const existing = queryOne('SELECT * FROM meal_plans WHERE id = ?', [id]);
+  const existing = queryOne('SELECT * FROM meal_plans WHERE id = ? AND user_id = ?', [id, req.userId]);
   if (!existing) return res.status(404).json({ error: 'Meal plan item not found' });
 
-  execute('DELETE FROM meal_plans WHERE id = ?', [id]);
+  execute('DELETE FROM meal_plans WHERE id = ? AND user_id = ?', [id, req.userId]);
   res.json({ deleted: true, id });
 });
 

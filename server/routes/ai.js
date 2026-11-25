@@ -1,6 +1,10 @@
 const express = require('express');
 const router = express.Router();
-const { queryAll, queryOne } = require('../db');
+const { queryAll } = require('../db');
+const { MEAL_TYPES, readEnum, readImageData, readText } = require('../utils/validate');
+const { getProfileRow } = require('../middleware/auth');
+
+const PROVIDER_TIMEOUT_MS = 30_000;
 
 /**
  * Pluggable Custom AI Vision Provider
@@ -43,7 +47,7 @@ async function callCustomAiProvider({ image_data, meal_name, meal_type, profile 
     },
   ];
 
-  if (image_data && String(image_data).startsWith('data:image/')) {
+  if (image_data) {
     contentParts.push({
       type: 'image_url',
       image_url: { url: image_data },
@@ -52,6 +56,7 @@ async function callCustomAiProvider({ image_data, meal_name, meal_type, profile 
 
   const response = await fetch(apiUrl, {
     method: 'POST',
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
@@ -69,7 +74,7 @@ async function callCustomAiProvider({ image_data, meal_name, meal_type, profile 
 
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`Custom AI provider returned HTTP ${response.status}: ${errText}`);
+    throw new Error(`Custom AI provider returned HTTP ${response.status}: ${errText.slice(0, 300)}`);
   }
 
   const data = await response.json();
@@ -78,55 +83,86 @@ async function callCustomAiProvider({ image_data, meal_name, meal_type, profile 
     throw new Error('Custom AI provider returned an empty response');
   }
 
-  const parsed = typeof rawContent === 'string' ? JSON.parse(rawContent) : rawContent;
+  // Some providers wrap JSON in ```json fences even when asked not to.
+  const parsed =
+    typeof rawContent === 'string'
+      ? JSON.parse(rawContent.replace(/^```(?:json)?\s*|\s*```$/g, ''))
+      : rawContent;
+
   return {
-    meal_name: parsed.meal_name || meal_name || 'Analyzed Meal',
-    calories: Math.max(0, Math.round(Number(parsed.calories) || 0)),
-    protein_g: Math.max(0, Number(Number(parsed.protein_g || 0).toFixed(1))),
-    carbs_g: Math.max(0, Number(Number(parsed.carbs_g || 0).toFixed(1))),
-    fat_g: Math.max(0, Number(Number(parsed.fat_g || 0).toFixed(1))),
-    health_note: parsed.health_note || '',
+    meal_name: String(parsed.meal_name || meal_name || 'Analyzed Meal').slice(0, 120),
+    calories: Math.min(20000, Math.max(0, Math.round(Number(parsed.calories) || 0))),
+    protein_g: Math.min(2000, Math.max(0, Number(Number(parsed.protein_g || 0).toFixed(1)))),
+    carbs_g: Math.min(2000, Math.max(0, Number(Number(parsed.carbs_g || 0).toFixed(1)))),
+    fat_g: Math.min(2000, Math.max(0, Number(Number(parsed.fat_g || 0).toFixed(1)))),
+    health_note: String(parsed.health_note || '').slice(0, 400),
     source: 'custom_ai',
   };
 }
 
+const FILLER_WORDS = new Set([
+  'with', 'and', 'the', 'plate', 'bowl', 'meal', 'fresh', 'cooked', 'homemade', 'small', 'large',
+]);
+
+// "eggs" -> "egg", "oats" -> "oat"; leaves "glass"/"hass" alone.
+function stem(word) {
+  return word.length > 3 && word.endsWith('s') && !word.endsWith('ss') ? word.slice(0, -1) : word;
+}
+
+function wordsOf(text) {
+  return String(text).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(stem);
+}
+
 /**
- * Deterministic fallback estimator used until FOODY_AI_API_KEY is configured.
- * Matches keywords against Foody's local SQLite foods catalog and generates
- * personalized guidance using the user's weight, height, age, and goal.
+ * Whole-word match against the local catalog. A dish that matches several
+ * words of one catalog entry ("chicken power bowl") uses that single entry;
+ * otherwise each word picks its simplest catalog food ("chicken rice" ->
+ * chicken breast + jasmine rice). Substrings never match ("ham" != "graham").
+ */
+function matchCatalogFoods(cleanName, foods) {
+  const tokens = [...new Set(wordsOf(cleanName).filter((t) => t.length >= 3 && !FILLER_WORDS.has(t)))];
+  if (tokens.length === 0) return [];
+
+  const indexed = foods.map((food) => ({ food, words: wordsOf(food.name) }));
+
+  const multi = indexed
+    .map((entry) => ({ ...entry, hits: tokens.filter((t) => entry.words.includes(t)).length }))
+    .filter((entry) => entry.hits >= 2)
+    .sort((a, b) => b.hits - a.hits || a.words.length - b.words.length);
+  if (multi.length > 0) return [multi[0].food];
+
+  const picked = new Map();
+  for (const token of tokens) {
+    const best = indexed
+      .filter((entry) => entry.words.includes(token))
+      .sort((a, b) => a.words.length - b.words.length || a.food.name.localeCompare(b.food.name))[0];
+    if (best) picked.set(best.food.id, best.food);
+    if (picked.size >= 3) break;
+  }
+  return [...picked.values()];
+}
+
+/**
+ * Deterministic fallback estimator used until FOODY_AI_API_KEY is configured
+ * (or when the provider is unreachable). It is a rough guide, not a photo
+ * analysis, and the response says so via `source: 'local_preview'`.
  */
 function buildFallbackEstimate({ meal_name, meal_type, profile }) {
   const cleanName = String(meal_name || '').trim();
-  const foods = queryAll('SELECT * FROM foods');
-
-  let matched = [];
-  if (cleanName) {
-    const tokens = cleanName
-      .toLowerCase()
-      .split(/[^a-z0-9]+/)
-      .filter((t) => t.length >= 3 && !['with', 'and', 'the', 'plate', 'bowl', 'meal'].includes(t));
-
-    if (tokens.length > 0) {
-      for (const food of foods) {
-        const fname = food.name.toLowerCase();
-        if (tokens.some((tok) => fname.includes(tok))) {
-          matched.push(food);
-          if (matched.length >= 3) break;
-        }
-      }
-    }
-  }
+  const matched = cleanName ? matchCatalogFoods(cleanName, queryAll('SELECT * FROM foods')) : [];
 
   let calories;
   let protein_g;
   let carbs_g;
   let fat_g;
+  let basis;
 
   if (matched.length > 0) {
     calories = Math.round(matched.reduce((s, f) => s + Number(f.calories || 0), 0));
     protein_g = Number(matched.reduce((s, f) => s + Number(f.protein_g || 0), 0).toFixed(1));
     carbs_g = Number(matched.reduce((s, f) => s + Number(f.carbs_g || 0), 0).toFixed(1));
     fat_g = Number(matched.reduce((s, f) => s + Number(f.fat_g || 0), 0).toFixed(1));
+    basis = `One standard serving of ${matched.map((f) => f.name).join(' + ')}.`;
   } else {
     const defaultsByMeal = {
       breakfast: { calories: 440, protein_g: 28, carbs_g: 48, fat_g: 14 },
@@ -134,24 +170,24 @@ function buildFallbackEstimate({ meal_name, meal_type, profile }) {
       dinner: { calories: 540, protein_g: 42, carbs_g: 46, fat_g: 18 },
       snack: { calories: 220, protein_g: 18, carbs_g: 24, fat_g: 6 },
     };
-    const preset = defaultsByMeal[meal_type] || defaultsByMeal.lunch;
-    ({ calories, protein_g, carbs_g, fat_g } = preset);
+    ({ calories, protein_g, carbs_g, fat_g } = defaultsByMeal[meal_type]);
+    basis = `A typical ${meal_type} portion, because the meal name did not match anything in the food list.`;
   }
 
   const targetCal = profile?.daily_calorie_target || 2290;
   const sharePct = Math.round((calories / targetCal) * 100);
   const goalText =
-    profile?.goal === 'cut'
-      ? 'fat-loss'
-      : profile?.goal === 'bulk'
-      ? 'muscle-gain'
-      : 'maintenance';
+    profile?.goal === 'cut' ? 'fat-loss' : profile?.goal === 'bulk' ? 'muscle-gain' : 'maintenance';
 
+  const proteinAdvice =
+    matched.length === 0
+      ? '.'
+      : protein_g >= 30
+      ? ', with a strong protein portion for recovery and fullness.'
+      : '. Consider pairing it with another protein source to reach your daily target.';
   const health_note =
-    `Estimated at ${sharePct}% of your ${targetCal.toLocaleString()} daily Calories for your ${goalText} goal` +
-    (protein_g >= 30
-      ? ' — strong protein portion to support recovery and satiety.'
-      : ' — consider pairing with an extra protein source to hit your daily target.');
+    `${basis} About ${sharePct}% of your ${targetCal.toLocaleString('en-US')} daily Calories for your ${goalText} goal` +
+    proteinAdvice;
 
   return {
     meal_name: cleanName || `${meal_type.charAt(0).toUpperCase() + meal_type.slice(1)} Meal`,
@@ -167,26 +203,27 @@ function buildFallbackEstimate({ meal_name, meal_type, profile }) {
 // POST /api/ai/analyze-meal
 router.post('/ai/analyze-meal', async (req, res, next) => {
   try {
-    const { image_data = '', meal_name = '', meal_type = 'lunch' } = req.body || {};
-    const profile = queryOne('SELECT * FROM user_profile WHERE id = 1') || {};
-    const mergedProfile = { ...profile, ...(req.body?.profile || {}) };
+    const body = req.body || {};
+    const image_data = readImageData(body.image_data);
+    const meal_name = readText(body.meal_name, '', 120);
+    const meal_type = readEnum(body.meal_type, MEAL_TYPES, 'lunch', 'meal_type');
+    // Always use the stored profile — the client copy could be stale or tampered with.
+    const profile = getProfileRow(req.userId) || {};
 
     let result = null;
+    let notice = '';
     if (process.env.FOODY_AI_API_URL && process.env.FOODY_AI_API_KEY) {
-      result = await callCustomAiProvider({
-        image_data,
-        meal_name,
-        meal_type,
-        profile: mergedProfile,
-      });
+      try {
+        result = await callCustomAiProvider({ image_data, meal_name, meal_type, profile });
+      } catch (err) {
+        console.error('[Foody AI] Provider failed, using local estimate:', err.message);
+        notice = 'Photo analysis is unavailable right now, so this is a rough estimate.';
+      }
     }
 
     if (!result) {
-      result = buildFallbackEstimate({
-        meal_name,
-        meal_type,
-        profile: mergedProfile,
-      });
+      result = buildFallbackEstimate({ meal_name, meal_type, profile });
+      if (notice) result.notice = notice;
     }
 
     res.json(result);

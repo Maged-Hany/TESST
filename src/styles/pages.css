@@ -1,0 +1,581 @@
+/* =====================================================================
+   Workouts, Meal Plan, Account & Side Athlete Streak System
+   Extends the exact tokens & layout grammar of my-calories.css
+   ===================================================================== */
+
+/* ---------- Small Side Athlete Streak Badge (>10 Crimson Tier) ---------- */
+
+.streak-dock {
+  position: fixed;
+  top: clamp(20px, 3.4vh, 36px);
+  right: clamp(16px, 2.8vw, 38px);
+  z-index: 32;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 14px 4px 5px;
+  background: rgba(14, 22, 29, 0.72);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(230, 229, 224, 0.28);
+  color: var(--chalk);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 180ms ease, background 200ms ease, box-shadow 200ms ease;
+}
+
+.streak-dock:hover {
+  border-color: var(--chalk);
+}
+
+/* > 10 Days Elite Tier: Shifts badge color to the athlete's crimson sash */
+.streak-dock.is-elite {
+  background: linear-gradient(135deg, rgba(168, 50, 38, 0.42) 0%, rgba(22, 14, 17, 0.92) 72%);
+  border-color: #d64937;
+  box-shadow: 0 10px 28px rgba(168, 50, 38, 0.34);
+}
+
+.streak-dock__figure {
+  width: 34px;
+  height: 40px;
+  overflow: hidden;
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: rgba(230, 229, 224, 0.05);
+  border: 1px solid rgba(230, 229, 224, 0.12);
+}
+
+.streak-dock.is-elite .streak-dock__figure {
+  background: rgba(168, 50, 38, 0.24);
+  border-color: rgba(224, 113, 95, 0.42);
+}
+
+.streak-dock__figure img {
+  width: 100%;
+  height: 145%;
+  object-fit: cover;
+  object-position: top center;
+}
+
+.streak-dock__body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.streak-dock__top {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.streak-dock__num {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 20px;
+  line-height: 1;
+  color: var(--chalk);
+}
+
+.streak-dock.is-elite .streak-dock__num {
+  color: #ffd8d1;
+}
+
+.streak-dock__unit {
+  font-size: 11.5px;
+  color: var(--chalk);
+}
+
+.streak-dock__sub {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--slate);
+}
+
+.streak-dock.is-elite .streak-dock__sub {
+  color: #eb8f81;
+}
+
+/* ---------- "You got a streak" Popup Modal ---------- */
+
+.streak-dialog {
+  width: min(410px, calc(100vw - 24px));
+}
+
+.streak-dialog.is-elite {
+  background: linear-gradient(165deg, #271314 0%, #101820 65%);
+  border-color: #d64937;
+}
+
+.streak-dialog__panel {
+  padding: 30px 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 14px;
+}
+
+.streak-dialog__emblem {
+  width: 64px;
+  height: 78px;
+  overflow: hidden;
+  border: 1px solid rgba(230, 229, 224, 0.24);
+  background: rgba(230, 229, 224, 0.05);
+}
+
+.streak-dialog.is-elite .streak-dialog__emblem {
+  border-color: rgba(224, 113, 95, 0.5);
+  background: rgba(168, 50, 38, 0.22);
+}
+
+.streak-dialog__emblem img {
+  width: 100%;
+  height: 145%;
+  object-fit: cover;
+  object-position: top center;
+}
+
+.streak-dialog__title {
+  margin: 4px 0 0;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 32px;
+  line-height: 1.1;
+}
+
+.streak-dialog__copy {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--slate);
+  max-width: 34ch;
+}
+
+.streak-dialog__copy strong {
+  color: var(--chalk);
+  font-weight: 500;
+}
+
+.streak-dialog__week {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  margin: 6px 0 8px;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--hairline);
+}
+
+.streak-dialog__day {
+  padding: 9px 2px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: rgba(158, 155, 147, 0.55);
+}
+
+.streak-dialog__day + .streak-dialog__day {
+  border-left: 1px solid var(--hairline-soft);
+}
+
+.streak-dialog__day.is-logged {
+  background: rgba(230, 229, 224, 0.1);
+  color: var(--chalk);
+}
+
+.streak-dialog.is-elite .streak-dialog__day.is-logged {
+  background: rgba(168, 50, 38, 0.28);
+  color: #ffe2dc;
+}
+
+.streak-dialog__day-mark {
+  height: 14px;
+  display: grid;
+  place-items: center;
+}
+
+.streak-dialog__cta {
+  width: 100%;
+  justify-content: space-between;
+}
+
+/* ---------- Workouts Page ---------- */
+
+.wk-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.wk-split-picker {
+  width: min(300px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wk-day__tag {
+  font-family: var(--font-display);
+  font-size: 18px;
+  line-height: 1.15;
+  color: var(--chalk);
+  max-width: 100%;
+  padding: 0 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mc-day.is-selected .wk-day__tag {
+  color: var(--iron);
+}
+
+.wk-main {
+  grid-column: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 48px;
+  min-width: 0;
+}
+
+.wk-hero-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.wk-strong {
+  color: var(--chalk);
+  font-weight: 500;
+}
+
+.wk-sk-list {
+  margin-top: 36px;
+}
+
+.wk-ex-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 15px 0;
+}
+
+.wk-ex-head__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 5px 0 0;
+  font-size: 12.5px;
+  color: var(--slate);
+}
+
+.wk-ex-head__meta strong {
+  color: var(--chalk);
+  font-weight: 500;
+}
+
+.wk-ex-head__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.wk-rec-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wk-rec-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 11px;
+  background: rgba(14, 22, 29, 0.45);
+  border: 1px solid var(--hairline-soft);
+  color: var(--slate);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 140ms ease, background-color 140ms ease, color 140ms ease;
+}
+
+.wk-rec-item:hover {
+  border-color: var(--hairline);
+  color: var(--chalk);
+}
+
+.wk-rec-item.is-chosen {
+  background: rgba(230, 229, 224, 0.11);
+  border-color: var(--chalk);
+  color: var(--chalk);
+}
+
+.wk-rec-item__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--slate);
+  flex-shrink: 0;
+}
+
+.wk-rec-item.is-chosen .wk-rec-item__badge {
+  color: var(--chalk);
+}
+
+.wk-video {
+  border: 1px solid var(--hairline);
+  background: #0b1117;
+}
+
+.wk-video__frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #080d12;
+}
+
+.wk-video__frame iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+.wk-video__meta {
+  padding: 10px 12px;
+  border-top: 1px solid var(--hairline-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wk-video__cue {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--slate);
+}
+
+.wk-video__ext {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  width: fit-content;
+  font-size: 11.5px;
+}
+
+.wk-triple {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.wk-history-rows {
+  margin-top: 16px;
+}
+
+.wk-unit {
+  font-family: var(--font-body);
+  font-size: 12px;
+  color: var(--slate);
+}
+
+/* ---------- Meal Plan Page ---------- */
+
+.mp-servings-row {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 14px;
+  align-items: end;
+}
+
+.mp-servings-preview {
+  margin: 0;
+  padding-bottom: 10px;
+  font-size: 12.5px;
+  color: var(--slate);
+}
+
+.mp-servings-preview strong {
+  color: var(--chalk);
+  font-weight: 500;
+}
+
+.mp-row__actions {
+  gap: 16px;
+}
+
+.mp-logged {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--chalk);
+}
+
+.mp-feedback {
+  color: var(--chalk);
+  font-size: 12.5px;
+}
+
+/* ---------- Account Registration & Sign-In Page ---------- */
+
+.auth-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(320px, 440px);
+  gap: 48px;
+  align-items: center;
+  padding-top: 4vh;
+}
+
+.auth-kicker {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  color: var(--slate);
+}
+
+.auth-points {
+  margin: 24px 0 0;
+  padding: 18px 0 0;
+  list-style: none;
+  border-top: 1px solid var(--hairline-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--slate);
+  max-width: 48ch;
+}
+
+.auth-points li::before {
+  content: '· ';
+  color: var(--chalk);
+}
+
+.auth-panel {
+  padding: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.auth-panel__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.auth-cta-full {
+  width: 100%;
+  justify-content: space-between;
+}
+
+.f-btn-secondary.auth-cta-full {
+  justify-content: center;
+}
+
+.auth-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  margin-top: 28px;
+  max-width: 520px;
+}
+
+.auth-stat {
+  padding: 18px;
+  border: 1px solid var(--hairline);
+  background: rgba(14, 22, 29, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.auth-stat.is-elite {
+  border-color: #d64937;
+  background: linear-gradient(145deg, rgba(168, 50, 38, 0.25), rgba(14, 22, 29, 0.7));
+}
+
+.auth-stat__label {
+  font-size: 12px;
+  color: var(--slate);
+}
+
+.auth-stat__num {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 30px;
+  line-height: 1.05;
+  color: var(--chalk);
+}
+
+.auth-stat__note {
+  font-size: 12px;
+  color: var(--slate);
+}
+
+/* ---------- Responsive Adjustments ---------- */
+
+@media (max-width: 1120px) {
+  /* Move the compact side streak badge to bottom-left when top navbar nears side edges */
+  .streak-dock {
+    top: auto;
+    right: auto;
+    left: 16px;
+    bottom: 16px;
+  }
+}
+
+@media (max-width: 1040px) {
+  .wk-main {
+    grid-column: auto;
+  }
+
+  .auth-grid {
+    grid-template-columns: minmax(0, 1fr);
+    padding-top: 1vh;
+  }
+}
+
+@media (max-width: 680px) {
+  .wk-day__tag {
+    font-size: 13.5px;
+  }
+
+  .auth-stats {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .streak-dock {
+    left: 12px;
+    bottom: 12px;
+    padding: 3px 11px 3px 4px;
+  }
+
+  .streak-dock__figure {
+    width: 28px;
+    height: 34px;
+  }
+
+  .streak-dock__num {
+    font-size: 17px;
+  }
+}
